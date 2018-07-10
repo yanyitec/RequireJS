@@ -1,0 +1,414 @@
+//import Promise, { Deferred,IPromise } from "./promise";
+
+
+interface IResInfo{
+    url?:string,
+    elementFactory?:(url:string)=>HTMLElement;
+    onload?:()=>void;
+    onerror?:(err,msg)=>void;
+    element?:HTMLElement;
+    
+    [key:string]:any;
+}
+interface IModule extends IPromise{
+    key:string;
+    loaded:boolean;
+    hasError:boolean;
+    value:()=>any;
+    type:string;
+    resInfo:IResInfo;
+    dynamic:boolean;
+}
+interface IDefineTrans{
+    callback?:(value:any,error:any)=>void;
+    module?:IModule;
+    exports?:{};
+}
+interface IModuleData{
+    define:(imports:Array<string>,defination?:Function)=>void;
+    require:(deps:Array<string>,complete?:Function)=>void;
+    exports:{};
+    modules:{[key:string]:IModule};
+    bas_url:string;
+    sys_urls:{[sysId:string]:Array<string>};
+    c_ver:string;
+    basUrl(url:string);
+    useExports:boolean;
+    __define__?:IDefineTrans;
+}
+interface IModules extends IModuleData{
+    (imports:any,defination?:any):void;
+}
+
+let __module__:IModules = (():IModules=>{
+    
+    function define(imports :any,defination:any){
+        let argt = typeof imports;
+        let defineTrans:IDefineTrans = mdata.__define__ ={};
+        let taskcount =1;
+        let args:Array<any> = [];
+        let error :any;
+        let promise:Deferred = new Deferred();
+        let callback = function(value,error){
+            callback = undefined;
+            setTimeout(()=>{
+                if(error){
+                    if(defineTrans.callback) defineTrans.callback(undefined,error);
+                    promise.reject(error);
+                }else {
+                    if(defineTrans.callback) defineTrans.callback(value,undefined);
+                    promise.resolve(defineTrans.module);
+                }
+            },0);
+            
+        };
+        let tryFinish = function(){
+            if(error){
+                callback(undefined,error);
+                return;
+            }
+            if(--taskcount==0 ){
+                let value:any;
+                if( defination){
+                    //try{
+                        value = defination.apply(this,args);
+                    //}catch(ex){
+                     //   error = {
+                     //       "statusText":"error",
+                     //       message:"define failed",
+                     //       detail:ex
+                     //   };
+                     //   console.error(error);
+                    //}
+                    if(value===undefined) value = __exports["default"];
+                    __exports["default"]=undefined;
+                }
+                callback(value,error);
+            }
+        }
+        if(argt==="string"){
+            if(imports[0]==="!"){
+                let key = imports.substr(1);
+                var module:IModule = modules[key];
+                if(modules[key] || modules[imports]) throw new Error("already defined");
+                modules[key] = modules[imports] = new Module(imports,defination);
+                return;
+            }
+            var module:IModule = ensureModule(imports);
+           module.resolve(defination);
+            
+            return;
+        }
+        if(argt==="function" ){
+            taskcount = 1;
+            defination = imports;
+            tryFinish();
+            return;
+        }
+                
+        
+        taskcount += imports.length;
+        
+        for(let i =0,j=imports.length;i<j;i++){
+            
+            var depname = imports[i];
+            var module:IModule = ensureModule(depname);
+            
+            module.done((value,index)=>{
+                args[index]=value;
+                tryFinish();
+            },i).fail((err)=>{
+                error = err;
+                tryFinish();
+            });
+        }
+        tryFinish();
+        return promise;
+    }
+
+    function require(invocation:any,depts?:any):Promise{
+        let isApply = invocation==="::apply-invoke"?invocation:false;
+        let promise :Deferred= new Deferred();
+        let result :Array<any>=[];
+        let error :any;
+        let keys :any;
+        if(isApply )keys = depts;
+        else if(invocation.push && invocation.pop) keys=invocation;
+        else keys = arguments;
+        let taskcount = keys.length+1;
+        for(let i =0,j=keys.length;i<j;i++){
+            let key = keys[i];
+            var module:IModule = ensureModule(key);
+            
+            module.done((value,param)=>{
+                result[param.index] = value;
+                if(--taskcount==0 && !error){
+                    promise.resolve(result);
+                }
+            },{index:i,$invocation:isApply}).fail((value)=>{
+                error = value;
+                promise.reject(error);
+            },i);
+        }
+        if(--taskcount==0 && !error){
+            promise.resolve(result);
+        }
+        return promise;
+    }
+
+    class Module extends Deferred implements IModule{
+        key:string;
+        loaded:boolean;
+        hasError:boolean;
+        type:string;
+        _value:any;
+        dynamic:boolean;
+        resInfo :IResInfo;
+
+        constructor(key:string,value?:any){
+            super();
+            this.key = key;
+            this.hasError = false;
+            this.dynamic=false;
+            if(value!==undefined){
+                if(key[0]==="!"){
+                    this.loaded = true;
+                    this.dynamic=true;
+                    this.value = ()=>value(this);
+                    this.resolve(value(this));
+                }else{
+                    this.loaded = true;
+                    this.resolve(value);
+                }
+                
+                return;
+            }
+
+            this.done((value)=>{
+                if(tick){ clearTimeout(tick);tick=undefined;}
+                this._value = value;this.loaded=true;
+            });
+            this.fail((value)=>{
+                if(tick){ clearTimeout(tick);tick=undefined;}
+                this._value = value;
+                this.hasError = true;
+            });
+            this.loaded =false;
+
+            let tick = setTimeout(()=>{
+                if(tick){ clearTimeout(tick);tick=undefined;}
+                this._loadResource();
+            },0);
+        }
+
+        value(){
+            return this._value;
+        }
+        
+        private _loadResource(){
+            let key = this.key.toLowerCase();
+            let existed = modules[key];
+            if(existed && existed!=this){
+                throw new Error("already load a resource named:" + existed.key);
+            }
+            let urls = getResUrls(this.key,this.type);
+            let load = loadScript;
+
+            let mod = this;
+            let retry_count = 5;
+            let urlAt = 0;
+            let doLoad =function(){
+                let url = urls[urlAt++];
+                if(url===undefined){
+                    if(--retry_count==0) {
+                        let err = {statusText:"error",message:"cannot load resource",moduleKey:mod.key,urls:urls};
+                        console.error(err);
+                        mod.reject(err);
+                        return;
+                    }
+
+                    console.warn({statusText:"error",message:"cannot load resource. Retry..",moduleKey:mod.key,urls:urls});
+
+                    url = urls[0];
+                    urlAt=1;
+                }
+                let resInfo:IResInfo = {
+                    url:url,
+                    
+                    onerror:(err,msg)=>{
+                        console.warn({statusText:"error",message:"cannot load resource. Try to another url..",detail:err,moduleKey:mod.key,url:resInfo.url});
+                        urlAt++;
+                        doLoad();
+                    },
+                    onload:()=>{
+                        if(mdata.__define__) {
+                            mdata.__define__.callback =(value:any)=> {
+                                if(mdata.useExports && value) value["default"] = value; 
+                                if(!mod.loaded && !mod.hasError)mod.resolve(value);
+                            };
+                            mdata.__define__.module = mod;
+                            mdata.__define__.exports = __exports;
+                        }
+                        else {
+                            if(!mod.loaded && !mod.hasError)mod.resolve(__exports["default"]);
+                        }
+                        mdata.__define__=undefined;
+                    }
+                };
+                load(resInfo);
+            };
+            doLoad();
+        }
+    }
+
+    function ensureModule(key:string):IModule{
+        let mod :IModule = modules[key];
+        if(mod)return mod;
+        key = key.toLowerCase();
+        mod  = modules[key];
+        if(mod){
+            return modules[key] = mod;
+        }
+        let at = key.indexOf("@");
+        let shortKey :string;
+        let locKey:string;
+        if(at>=0){
+            shortKey = key.substr(0,at);
+            locKey = key.substr(at+1);
+            mod  = modules[shortKey];
+            let locMod = modules[locKey];
+            if(mod){
+                
+                if(!locMod) modules[locKey] = mod;
+                return modules[key] = mod;
+            }
+            mod = modules[locKey];
+            if(mod){
+                return modules[shortKey] = modules[key] = mod;
+            }
+            
+        }
+        mod = new Module(key);
+        if(shortKey) modules[shortKey] = modules[locKey] = mod;
+        modules[key] = mod;
+        return mod;
+    }
+
+    function loadScript(resInfo:IResInfo){
+        resInfo.elementFactory = (url:string):HTMLElement=>{
+            let elem :HTMLScriptElement = document.createElement("script") as HTMLScriptElement;
+            elem.type = resInfo["type"]|| "text/javascript";
+            elem.src= url;
+            return elem;
+        };
+        loadResource(resInfo);
+    }
+
+    function loadResource(resInfo:IResInfo):void{
+        let elem = resInfo.element = resInfo.elementFactory(resInfo.url);
+        
+        if((elem as any).onreadystatechange!==undefined){
+            (elem as any).onreadystatechange = function(){
+                if((elem as any).readyState==4 || (elem as any).readyState=="complete"){
+                    if(resInfo.onload) resInfo.onload.call(elem);
+                }
+            }
+        }else elem.onload = resInfo.onload;
+        (elem as any).onerror = function(err,msg){
+            if(resInfo.onerror) resInfo.onerror.call(elem,err,msg);
+        }
+        let head= getHead();
+        head.appendChild(elem);
+        
+    }
+
+    let mdata:IModules = (define as any) as IModules;
+
+    let getHead:()=>HTMLHeadElement =():HTMLHeadElement =>{
+        let head : HTMLHeadElement;
+        let heads = document.getElementsByTagName("head");
+        if(heads && heads.length) head = heads[0] as HTMLHeadElement;
+        else if(document.documentElement && document.documentElement.firstChild) head = document.documentElement.firstChild as HTMLHeadElement; 
+        else head = document.body as HTMLHeadElement;
+        getHead = ()=>head;
+        return head;
+    }
+    
+    
+    
+    let sysIdReg = /^\[([a-zA-Z0-9_\-]+)\]/g;
+
+    function getResUrls(key:string,type:string="js"):Array<string>{
+        if(key.indexOf("http://")==0 || key.indexOf("https://")==0) return [key];
+        let atAt = key.indexOf("@");
+        if(atAt>=0){
+            key = key.substr(atAt+1);
+        }
+        let resUrls= [];
+        let sysUrls:Array<string>=[];
+        let match = key.match(sysIdReg);
+        let ver = mdata.c_ver;
+        if(match){
+            let sysId = match[1].toLowerCase();
+            let urls = sys_urls[sysId];
+            if(!urls)urls=[bas_url];
+            else {
+                for(let i =0,j=urls.length;i<j;i++) sysUrls.push(urls[i]);
+            }
+        }else sysUrls=[bas_url];
+        let extname = "." + type;
+        for(let i=0,j=sysUrls.length;i<j;i++){
+            let url = sysUrls[i];
+            if(url.indexOf("http://")<0 && url.indexOf("https://")<0) {
+                url = bas_url + url;
+            }
+            if(url[url.length-1]!='/') url += '/';
+            url += key;
+            let at = url.indexOf(extname);
+            if(at!=url.length-extname.length) url += extname;
+            url += "?v=" + ver;
+            resUrls.push(url);
+        }
+        return resUrls;
+    }
+    
+    
+    
+    
+    
+    
+
+    mdata.basUrl = (url:string)=>{mdata.bas_url = bas_url=url;};
+    mdata.useExports = true;
+    mdata.define = define;
+    mdata.Promise = Deferred;
+    let __exports:{} = mdata.exports = {"__module_exports":true};
+    let modules:{[key:string]:IModule} = mdata.modules={};
+    let sys_urls = mdata.sys_urls={};
+    mdata.c_ver = "1.0.0";
+    let paths = location.pathname.split("/");
+    paths.pop();
+    let path = paths.join("/");
+    let bas_url =  location.protocol + "//" + location.hostname + ":" + location.port + path;
+    if(bas_url[bas_url.length-1]!='/') bas_url += "/";
+    mdata.bas_url = bas_url;
+
+
+    
+    mdata.define = define;
+    mdata.require = require;
+    (mdata as any).amd = true;
+    try{
+        if(!(window as any).define)(window as any).define = define;
+    }catch(ex){}
+    try{
+        if(!(window as any).exports)(window as any).exports = __exports;
+    }catch(ex){}
+    
+    
+    define("require",require);
+    define("exports",__exports);
+    return mdata;
+})();
+
+
